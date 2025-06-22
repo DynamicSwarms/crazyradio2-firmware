@@ -34,10 +34,12 @@ static struct {
     bool ack_enabled;
     uint8_t scan_result[63];
     int scan_result_length;
+    bool stopped;
 } state = {
     .datarate = 2,
 	.channel = 2,
     .ack_enabled = true,
+    .stopped = true,
 };
 
 struct usb_crazyradio_config {
@@ -130,6 +132,7 @@ static struct usb_ep_cfg_data ep_cfg[] = {
 #define SET_CONT_CARRIER  0x20
 #define CHANNEL_SCANN     0x21
 #define SET_MODE          0x22
+#define START_STOP        0x23
 #define RESET_TO_BOOTLOADER 0xff
 
 // nRF24 power mapping
@@ -185,8 +188,8 @@ static int crazyradio_vendor_handler(struct usb_setup_packet *setup,
 		} else if (setup->bRequest == ACK_ENABLE && setup->wLength == 0) {
             bool enabled = setup->wValue != 0;
 			LOG_DBG("Setting radio ACK Enable %s", enabled?"true":"false");
-            state.ack_enabled = enabled;
-            esb_set_ack_enabled(enabled);
+            // state.ack_enabled = enabled;
+            // esb_set_ack_enabled(enabled);
 		} else if (setup->bRequest == SET_CONT_CARRIER && setup->wLength == 0) {
 			LOG_DBG("Setting radio Continious carrier %s", setup->wValue?"true":"false");
 
@@ -208,6 +211,19 @@ static int crazyradio_vendor_handler(struct usb_setup_packet *setup,
             *len = MIN(state.scan_result_length, setup->wLength);
 		} else if (setup->bRequest == SET_MODE && setup->wLength == 0) {
 			LOG_DBG("Setting radio Mode %d", setup->wValue);
+        } else if (setup->bRequest == START_STOP) {
+            LOG_DBG("Resetting queues");
+            k_msgq_purge(&command_queue);
+            if (setup->wValue == 1) {
+                LOG_DBG("Starting radio");
+                state.stopped = false;
+                esb_init();
+            } else {
+                LOG_DBG("Stopping radio");
+                state.stopped = true;
+                esb_deinit();
+            }
+           
         } else if (setup->bRequest == RESET_TO_BOOTLOADER && setup->wLength == 0) {
             system_reset_to_uf2();
 		} else {
@@ -259,11 +275,26 @@ static void usb_thread(void *, void *, void *) {
     uint8_t arc_counter;
 
     while(1) {
-        k_msgq_get(&command_queue, &command, K_FOREVER);
+        int failed = k_msgq_get(&command_queue, &command, K_FOREVER);
+        if (state.stopped || failed) continue; // Yes packet is dropped if stopped.
 
         // If we are not receiving ack (ie. broadcast) and the received data is > 32 bytes,
         // this means that the buffer actually contains 2 packets to send
-        if (!state.ack_enabled && command.length > 32) {
+        uint8_t addr;
+        bool new_mode = true;
+        if (new_mode) {
+            uint8_t address[5];
+            memcpy(address, command.payload, 5);
+            addr = address[4];
+            
+            state.ack_enabled = address[0] == 0xE7; 
+            esb_set_ack_enabled(address[0] == 0xE7);
+            esb_set_address(address);
+
+            // esb_set_address(command.payload);
+            memcpy(packet.data, command.payload + 5, command.length - 5);
+            packet.length = command.length - 5;
+        } else if (!state.ack_enabled && command.length > 32) {
             // Send the first one right away
             memcpy(packet.data, command.payload, command.length/2);
             packet.length = command.length/2;
@@ -280,7 +311,7 @@ static void usb_thread(void *, void *, void *) {
             memcpy(packet.data, command.payload, command.length);
             packet.length = command.length;
         }
-        
+    
         if (state.datarate != 0 && state.channel <= 100) {
             bool acked = esb_send_packet(&packet, &ack, &rssi, &arc_counter);
             if (ack.length > 32) {
@@ -292,7 +323,7 @@ static void usb_thread(void *, void *, void *) {
                 static char usb_answer[33];
                 usb_answer[0] = (arc_counter & 0x0f) << 4 | (rssi < 64)<<1 | 1;
                 memcpy(&usb_answer[1], ack.data, ack.length);
-            
+                
                 if (usb_write(CRAZYRADIO_IN_EP_ADDR, usb_answer, ack.length + 1, NULL)) {
                     LOG_DBG("ep 0x%x", CRAZYRADIO_IN_EP_ADDR);
                 }
